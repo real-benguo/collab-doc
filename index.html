@@ -1,0 +1,145 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+<title>共笔 · 多人协同文档</title>
+<meta name="description" content="多人在线协同编辑文档，端到端加密，可保存到本地。" />
+<meta http-equiv="Content-Security-Policy"
+      content="default-src 'none'; script-src 'self'; worker-src 'self' blob:; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self' data:; connect-src wss://broker.emqx.io:8084; base-uri 'none'; form-action 'none'" />
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%235b8cff'/%3E%3Ctext x='16' y='23' font-size='19' font-family='sans-serif' font-weight='bold' fill='%23fff' text-anchor='middle'%3E%E5%85%B1%3C/text%3E%3C/svg%3E" />
+<link rel="stylesheet" href="bundle.css" />
+<link rel="stylesheet" href="style.css" />
+</head>
+<body>
+
+<!-- ========== 进入页 ========== -->
+<section id="gate" class="gate">
+  <div class="gate-card">
+    <div class="brand">
+      <div class="brand-mark">共</div>
+      <div>
+        <h1>共笔</h1>
+        <p class="brand-sub">多人同时写一份文档 · 端到端加密</p>
+      </div>
+    </div>
+
+    <label class="field">
+      <span>房间号</span>
+      <input id="in-room" type="text" placeholder="例如 ben-team-01" autocomplete="off"
+             autocapitalize="off" spellcheck="false" maxlength="48" />
+      <small>同一房间号的人才能看到这份文档</small>
+    </label>
+
+    <label class="field">
+      <span>密码</span>
+      <div class="pw-wrap">
+        <input id="in-pass" type="password" placeholder="至少 4 位" autocomplete="off" maxlength="64" />
+        <button id="btn-eye" class="eye" type="button" title="显示/隐藏">👁</button>
+      </div>
+      <small>密码错了打不开内容。忘了密码 = 文档打不开，没有找回</small>
+    </label>
+
+    <label class="field">
+      <span>你的名字</span>
+      <input id="in-name" type="text" placeholder="显示给别人看，例如 老王" autocomplete="off" maxlength="16" />
+    </label>
+
+    <button id="btn-enter" class="btn btn-primary">进入房间</button>
+    <button id="btn-new" class="btn btn-ghost">新建一份文档</button>
+
+    <div id="gate-msg" class="gate-msg"></div>
+
+    <details class="tips">
+      <summary>怎么用？</summary>
+      <ol>
+        <li>点「新建一份文档」，系统给你一个房间号和密码。</li>
+        <li>把房间号 + 密码发给同事，让他们填进去点「进入房间」。</li>
+        <li>几个人同时打字，互相都能看到，不会互相覆盖。</li>
+        <li>写完点右上角「存到本地」，存成网页文件或纯文本，放自己电脑里。</li>
+      </ol>
+      <p class="tips-warn">内容不存服务器，只在你和同事的浏览器之间中转。所有人都关掉网页后，云端就没了——记得存本地。</p>
+    </details>
+  </div>
+</section>
+
+<!-- ========== 编辑页 ========== -->
+<section id="app" class="app hidden">
+  <header class="topbar">
+    <div class="topbar-left">
+      <span class="dot" id="conn-dot"></span>
+      <span id="room-label" class="room-label">—</span>
+      <span id="conn-text" class="conn-text">连接中…</span>
+    </div>
+    <div class="topbar-right">
+      <div id="peers" class="peers"></div>
+      <button id="btn-share" class="btn btn-mini">分享</button>
+      <button id="btn-save" class="btn btn-mini">存到本地</button>
+      <button id="btn-leave" class="btn btn-mini btn-quiet">退出</button>
+    </div>
+  </header>
+
+  <div id="toolbar" class="toolbar">
+    <span class="ql-formats">
+      <select class="ql-header">
+        <option value="1">标题 1</option>
+        <option value="2">标题 2</option>
+        <option value="3">标题 3</option>
+        <option selected>正文</option>
+      </select>
+    </span>
+    <span class="ql-formats">
+      <button class="ql-bold" title="加粗"></button>
+      <button class="ql-italic" title="斜体"></button>
+      <button class="ql-underline" title="下划线"></button>
+      <button class="ql-strike" title="删除线"></button>
+    </span>
+    <span class="ql-formats">
+      <button class="ql-list" value="ordered" title="有序列表"></button>
+      <button class="ql-list" value="bullet" title="无序列表"></button>
+      <button class="ql-list" value="check" title="待办"></button>
+    </span>
+    <span class="ql-formats">
+      <button class="ql-blockquote" title="引用"></button>
+      <button class="ql-code-block" title="代码块"></button>
+      <button class="ql-link" title="链接"></button>
+    </span>
+    <span class="ql-formats">
+      <button class="ql-clean" title="清除格式"></button>
+    </span>
+    <span class="toolbar-spacer"></span>
+    <span id="sync-hint" class="sync-hint">已同步</span>
+  </div>
+
+  <main class="editor-wrap">
+    <div id="editor"></div>
+  </main>
+</section>
+
+<!-- 保存菜单 -->
+<div id="save-menu" class="save-menu hidden">
+  <button data-fmt="html">存成网页（.html，双击能看，保留格式）</button>
+  <button data-fmt="txt">存成纯文本（.txt，手机备忘录能开）</button>
+  <button data-fmt="md">存成 Markdown（.md）</button>
+</div>
+
+<!-- 分享弹层 -->
+<div id="share-modal" class="modal hidden">
+  <div class="modal-card">
+    <h2>把这两样发给同事</h2>
+    <div class="share-row"><span>房间号</span><code id="share-room"></code></div>
+    <div class="share-row"><span>密码</span><code id="share-pass"></code></div>
+    <p class="modal-note">让对方打开同一个网址，填上房间号和密码，就能一起写。</p>
+    <div class="modal-actions">
+      <button id="btn-copy-share" class="btn btn-primary">复制邀请内容</button>
+      <button id="btn-close-share" class="btn btn-ghost">关闭</button>
+    </div>
+  </div>
+</div>
+
+<div id="toast" class="toast hidden"></div>
+
+<script src="vendor/mqtt.min.js"></script>
+<script src="bundle.js"></script>
+</body>
+</html>
