@@ -211,15 +211,25 @@ html, body {
     var(--bg);
 }
 
-.toolbar,
-#editor {
+.paper {
   max-width: 820px;
   margin: 0 auto;
   background: #fff;
+  border-radius: 14px;
+  box-shadow: 0 16px 44px rgba(0,0,0,.35);
+  min-height: calc(100vh - 130px);
+  display: flex;
+  flex-direction: column;
 }
+
+/* 去掉 Quill 自带的灰边框，纸张自己就是边框 */
+#toolbar.ql-toolbar.ql-snow,
+#editor.ql-container.ql-snow { border: 0; }
+
 .toolbar {
-  border-radius: 0 0 0 0;
+  border-radius: 14px 14px 0 0;
   border-bottom: 1px solid #eceff4;
+  background: #fff;
   position: sticky;
   top: 0;
   z-index: 20;
@@ -239,12 +249,12 @@ html, body {
 .sync-hint.offline { color: #d9534f; }
 
 #editor {
+  flex: 1;
   border-radius: 0 0 14px 14px;
-  min-height: calc(100vh - 210px);
-  box-shadow: 0 16px 44px rgba(0,0,0,.35);
+  background: #fff;
 }
 #editor .ql-editor {
-  min-height: calc(100vh - 210px);
+  min-height: calc(100vh - 230px);
   padding: 34px 42px 90px;
   font-size: 16px;
   line-height: 1.85;
@@ -343,8 +353,8 @@ html, body {
   .btn-mini { padding: 6px 9px; font-size: 12px; }
   .peers { display: none; }
   .editor-wrap { padding: 0 0 60px; }
-  .toolbar, #editor { max-width: none; border-radius: 0; }
-  .toolbar { top: 0; overflow-x: auto; flex-wrap: nowrap; padding: 0 4px; }
+  .paper { max-width: none; border-radius: 0; box-shadow: none; min-height: calc(100vh - 52px); }
+  .toolbar { top: 0; border-radius: 0; overflow-x: auto; flex-wrap: nowrap; padding: 0 4px; }
   .toolbar .ql-formats { margin-right: 4px; flex: none; }
   .sync-hint { display: none; }
   #editor .ql-editor { padding: 20px 18px 80px; font-size: 16px; }
