@@ -278,6 +278,19 @@ html, body {
   padding: 12px 14px; font-size: 14px;
 }
 #editor .ql-editor a { color: #2f6fe4; }
+#editor .ql-editor img {
+  max-width: 100%;
+  height: auto;
+  border-radius: 8px;
+  margin: 12px 0;
+}
+#editor .ql-editor img.gb-pending {
+  min-width: 160px;
+  min-height: 70px;
+  background: #f1f3f7;
+  border: 1px dashed #c9d0dd;
+  border-radius: 8px;
+}
 
 /* 远程光标 */
 .ql-cursor-flag { border-radius: 4px; padding: 1px 6px; font-size: 11px; }
