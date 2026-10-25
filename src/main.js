@@ -32,6 +32,17 @@ const T_UPDATE = 1
 const T_SNAP   = 2
 const T_AWARE  = 3
 const T_VERIFY = 4
+const T_IMG_META = 5
+const T_IMG_PART = 6
+const T_IMG_REQ  = 7
+
+/* 图片：压缩后切片走 retained 主题，文档里只留一个 gb:<id> 引用，
+   这样全量快照始终很小，图片也不会因为丢一个包就永远找不回来 */
+const IMG_CHUNK = 34000      // 每片 base64 字符数（约 25KB 原始数据）
+const IMG_MAX_KB = 900       // 单张图压缩后的硬上限
+const IMG_TARGET_KB = 120    // 压缩目标
+const IMG_MAX_SIDE = 1500    // 长边像素
+const BLANK_PX = 'data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7'
 
 const PALETTE = [
   '#e5534b', '#e8842c', '#d4a72c', '#4caf7d', '#2f9e8f',
@@ -156,12 +167,16 @@ let connected = false
 let joined = false
 
 const topics = {
-  update: '', snap: '', snapAll: '', aware: '', awareAll: '', verify: '', verifyAll: ''
+  update: '', snap: '', snapAll: '', aware: '', awareAll: '', verify: '', verifyAll: '',
+  imgAll: '', imgReq: ''
 }
 const lastSeen = new Map()      // mqttId -> { clientId, ts }
+const imgCache = new Map()      // imgId -> { url, w, h }
+const imgParts = new Map()      // imgId -> { n, w, h, got: Map<seq, str> }
 let snapTimer = null
 let awareTimer = null
 let localTimer = null
+let snapDirty = true
 
 /* ---------------- MQTT ---------------- */
 
@@ -218,7 +233,7 @@ function connectBroker () {
 }
 
 function subscribeAll () {
-  const list = [topics.update, topics.snapAll, topics.awareAll, topics.verifyAll]
+  const list = [topics.update, topics.snapAll, topics.awareAll, topics.verifyAll, topics.imgAll, topics.imgReq]
   list.forEach(t => client.subscribe(t, { qos: 1 }, () => {}))
 }
 
@@ -259,6 +274,13 @@ async function onMessage (topic, payload) {
     } catch (e) {}
   } else if (msg.type === T_VERIFY) {
     if (td.decode(msg.data).startsWith('gongbi-v1:' + rh)) markPasswordOk()
+  } else if (msg.type === T_IMG_META) {
+    try { onImgMeta(JSON.parse(td.decode(msg.data))) } catch (e) {}
+  } else if (msg.type === T_IMG_PART) {
+    try { onImgPart(JSON.parse(td.decode(msg.data))) } catch (e) {}
+  } else if (msg.type === T_IMG_REQ) {
+    // 有人刚进来，手里缺图 —— 在线的人把本地图片重播一遍
+    if (msg.myId !== myMqttId) republishImages()
   }
 }
 
@@ -267,6 +289,10 @@ async function onMessage (topic, payload) {
 function publishSnapshot () {
   if (!joined) return
   const state = Y.encodeStateAsUpdate(ydoc)
+  if (state.length > 700 * 1024) {
+    setSync('pending', '文档较大，只同步增量')
+    return
+  }
   sendEnc(T_SNAP, state, topics.snap, { retain: true, qos: 1 })
 }
 
@@ -391,7 +417,219 @@ function startPeerSweeper () {
   }, 5000)
 }
 
-/* ---------------- 保存到本地 ---------------- */
+/* ---------------- 图片 blot ---------------- */
+/* 文档里只存 gb:<id>，渲染时换成已收到的图片数据 */
+
+const BaseImage = Quill.import('formats/image')
+
+class GbImage extends BaseImage {
+  static create (value) {
+    const node = super.create(value)
+    const raw = String(value || '')
+    if (raw.startsWith('gb:')) {
+      const id = raw.slice(3)
+      node.dataset.gb = id
+      node.removeAttribute('src')
+      const c = imgCache.get(id)
+      node.setAttribute('src', c ? c.url : BLANK_PX)
+      if (c && c.w) node.setAttribute('width', String(Math.min(c.w, 680)))
+      if (!c) node.classList.add('gb-pending')
+    }
+    return node
+  }
+
+  static value (node) {
+    if (node.dataset && node.dataset.gb) return 'gb:' + node.dataset.gb
+    return node.getAttribute('src')
+  }
+}
+
+/* ---------------- 图片：压缩 / 切片 / 收发 ---------------- */
+
+function newImgId () {
+  return hex(crypto.getRandomValues(new Uint8Array(8)))
+}
+
+function loadImageEl (file) {
+  return new Promise((resolve, reject) => {
+    const url = URL.createObjectURL(file)
+    const img = new Image()
+    img.onload = () => { URL.revokeObjectURL(url); resolve(img) }
+    img.onerror = () => { URL.revokeObjectURL(url); reject(new Error('这张图打不开')) }
+    img.src = url
+  })
+}
+
+/* 压到能一起同步的大小：长边 1500、目标 120KB，实在压不下来再降 */
+async function compressImage (file) {
+  const img = await loadImageEl(file)
+  let scale = Math.min(1, IMG_MAX_SIDE / Math.max(img.naturalWidth, img.naturalHeight))
+  let quality = 0.82
+  let blob = null
+
+  for (let i = 0; i < 9; i++) {
+    const w = Math.max(1, Math.round(img.naturalWidth * scale))
+    const h = Math.max(1, Math.round(img.naturalHeight * scale))
+    const cv = document.createElement('canvas')
+    cv.width = w
+    cv.height = h
+    const ctx = cv.getContext('2d')
+    ctx.fillStyle = '#ffffff'
+    ctx.fillRect(0, 0, w, h)
+    ctx.drawImage(img, 0, 0, w, h)
+    blob = await new Promise(r => cv.toBlob(r, 'image/jpeg', quality))
+    if (!blob) throw new Error('这张图处理不了')
+    if (blob.size <= IMG_TARGET_KB * 1024) break
+    if (quality > 0.52) quality -= 0.11
+    else { scale *= 0.82; quality = 0.7 }
+  }
+
+  if (blob.size > IMG_MAX_KB * 1024) throw new Error('图太大了，裁一下再传')
+
+  const b64 = await new Promise((resolve, reject) => {
+    const fr = new FileReader()
+    fr.onload = () => resolve(String(fr.result).split(',')[1] || '')
+    fr.onerror = () => reject(new Error('读不出来'))
+    fr.readAsDataURL(blob)
+  })
+
+  return { b64, w: Math.round(img.naturalWidth * scale), h: Math.round(img.naturalHeight * scale), size: blob.size }
+}
+
+async function sendImage (b64, w, h) {
+  const id = newImgId()
+  const n = Math.max(1, Math.ceil(b64.length / IMG_CHUNK))
+
+  await sendEnc(T_IMG_META, te.encode(JSON.stringify({ id, n, w, h })),
+    `${PREFIX}/${rh}/i/${id}/m`, { retain: true, qos: 1 })
+
+  for (let i = 0; i < n; i++) {
+    const piece = b64.slice(i * IMG_CHUNK, (i + 1) * IMG_CHUNK)
+    await sendEnc(T_IMG_PART, te.encode(JSON.stringify({ id, i, d: piece })),
+      `${PREFIX}/${rh}/i/${id}/${i}`, { retain: true, qos: 1 })
+    if (i % 3 === 2) await new Promise(r => setTimeout(r, 60))
+  }
+
+  // 本地立刻缓存，自己的图不用等回传
+  imgCache.set(id, { url: 'data:image/jpeg;base64,' + b64, w, h })
+  return id
+}
+
+function onImgMeta (meta) {
+  if (!meta || !meta.id) return
+  const rec = imgParts.get(meta.id) || { got: new Map() }
+  rec.n = meta.n
+  rec.w = meta.w
+  rec.h = meta.h
+  imgParts.set(meta.id, rec)
+  tryAssemble(meta.id)
+}
+
+function onImgPart (p) {
+  if (!p || !p.id) return
+  const rec = imgParts.get(p.id) || { got: new Map() }
+  rec.got.set(p.i, p.d)
+  imgParts.set(p.id, rec)
+  tryAssemble(p.id)
+}
+
+function tryAssemble (id) {
+  if (imgCache.has(id)) return
+  const rec = imgParts.get(id)
+  if (!rec || !rec.n || rec.got.size < rec.n) return
+  let b64 = ''
+  for (let i = 0; i < rec.n; i++) {
+    const piece = rec.got.get(i)
+    if (piece == null) return
+    b64 += piece
+  }
+  imgCache.set(id, { url: 'data:image/jpeg;base64,' + b64, w: rec.w, h: rec.h })
+  refreshImages(id)
+}
+
+function refreshImages (id) {
+  if (!quill) return
+  const c = imgCache.get(id)
+  if (!c) return
+  quill.root.querySelectorAll('img[data-gb="' + id + '"]').forEach(el => {
+    el.src = c.url
+    el.classList.remove('gb-pending')
+    if (c.w) el.setAttribute('width', String(Math.min(c.w, 680)))
+  })
+}
+
+/* 有人进来时，把本地有的图片重播一遍（retained 覆盖，幂等） */
+let republishLock = false
+async function republishImages () {
+  if (republishLock || !imgCache.size) return
+  republishLock = true
+  try {
+    for (const [id, c] of imgCache) {
+      const b64 = String(c.url).split(',')[1] || ''
+      if (!b64) continue
+      const n = Math.max(1, Math.ceil(b64.length / IMG_CHUNK))
+      await sendEnc(T_IMG_META, te.encode(JSON.stringify({ id, n, w: c.w, h: c.h })),
+        `${PREFIX}/${rh}/i/${id}/m`, { retain: true, qos: 1 })
+      for (let i = 0; i < n; i++) {
+        await sendEnc(T_IMG_PART, te.encode(JSON.stringify({ id, i, d: b64.slice(i * IMG_CHUNK, (i + 1) * IMG_CHUNK) })),
+          `${PREFIX}/${rh}/i/${id}/${i}`, { retain: true, qos: 1 })
+        if (i % 3 === 2) await new Promise(r => setTimeout(r, 60))
+      }
+    }
+  } finally {
+    republishLock = false
+  }
+}
+
+function pickImage () {
+  const input = document.createElement('input')
+  input.type = 'file'
+  input.accept = 'image/*'
+  input.multiple = true
+  input.style.display = 'none'
+  document.body.appendChild(input)
+  input.onchange = () => {
+    const files = [...input.files]
+    input.remove()
+    insertImageFiles(files)
+  }
+  input.click()
+}
+
+let inserting = false
+async function insertImageFiles (files) {
+  const list = files.filter(f => f && f.type && f.type.startsWith('image/'))
+  if (!list.length) return
+  if (inserting) return
+  inserting = true
+  setSync('pending', '处理图片…')
+  let ok = 0
+  try {
+    for (const f of list) {
+      try {
+        const { b64, w, h } = await compressImage(f)
+        const id = await sendImage(b64, w, h)
+        const range = quill.getSelection(true) || { index: quill.getLength() - 1 }
+        let at = range.index
+        // 图片独占一行：光标前面有字就先断行
+        if (at > 0 && quill.getText(at - 1, 1) !== '\n') {
+          quill.insertText(at, '\n', 'user')
+          at++
+        }
+        quill.insertEmbed(at, 'image', 'gb:' + id, 'user')
+        quill.insertText(at + 1, '\n', 'user')
+        quill.setSelection(at + 2, 0, 'user')
+        ok++
+      } catch (e) {
+        toast((f.name ? f.name + '：' : '') + (e.message || '这张图传不了'), 3200)
+      }
+    }
+    if (ok) toast(ok > 1 ? `插好了 ${ok} 张图` : '图片插好了')
+  } finally {
+    inserting = false
+    setSync(connected ? 'ok' : 'offline', connected ? '已同步' : '离线（改动只存在本地）')
+  }
+}
 
 function docBaseName () {
   const d = new Date()
@@ -430,19 +668,33 @@ const HTML_SHELL = (title, body) => `<!DOCTYPE html>
   ul li[data-list=checked]::before{content:"☑ "}
   ul li[data-list=unchecked]::before{content:"☐ "}
   hr{border:0;border-top:1px solid #e6e9ef;margin:24px 0}
+  img{max-width:100%;height:auto;border-radius:8px;margin:12px 0;display:block}
 </style></head>
 <body>${body}</body></html>`
+
+/* 导出时把 gb:<id> 换成真实图片数据，存下来的文件在别的电脑上也能看 */
+function bodyWithImages () {
+  const clone = quill.root.cloneNode(true)
+  clone.querySelectorAll('img[data-gb]').forEach(el => {
+    const c = imgCache.get(el.dataset.gb)
+    if (c) {
+      el.setAttribute('src', c.url)
+      el.removeAttribute('class')
+      if (c.w) el.setAttribute('width', String(Math.min(c.w, 700)))
+    }
+  })
+  return clone.innerHTML
+}
 
 function exportAs (fmt) {
   if (!quill) return
   const base = docBaseName()
   if (fmt === 'html') {
-    download(base + '.html', HTML_SHELL(room, quill.root.innerHTML), 'text/html;charset=utf-8')
+    download(base + '.html', HTML_SHELL(room, bodyWithImages()), 'text/html;charset=utf-8')
   } else if (fmt === 'txt') {
     download(base + '.txt', quill.getText().replace(/\n{3,}/g, '\n\n').trim() + '\n', 'text/plain;charset=utf-8')
   } else if (fmt === 'md') {
-    const md = quill.getSemanticHTML ? quill.getSemanticHTML() : quill.root.innerHTML
-    download(base + '.md', htmlToMd(md), 'text/markdown;charset=utf-8')
+    download(base + '.md', htmlToMd(bodyWithImages()), 'text/markdown;charset=utf-8')
   }
   toast('已存到下载文件夹')
 }
@@ -468,6 +720,7 @@ function htmlToMd (html) {
       else if (tag === 'pre') out += '\n```\n' + inner.replace(/\n$/, '') + '\n```\n'
       else if (tag === 'blockquote') out += '\n' + inner.trim().split('\n').map(l => '> ' + l).join('\n') + '\n'
       else if (tag === 'a') out += '[' + inner + '](' + n.getAttribute('href') + ')'
+      else if (tag === 'img') out += '\n![' + (n.getAttribute('alt') || '图片') + '](' + (n.getAttribute('src') || '') + ')\n'
       else if (tag === 'li') {
         const parent = n.parentElement
         const ordered = parent && parent.tagName.toLowerCase() === 'ol'
@@ -517,6 +770,8 @@ async function enter (roomName, password, name, isNew) {
     topics.awareAll  = `${PREFIX}/${rh}/a/+`
     topics.verify    = `${PREFIX}/${rh}/v/${myMqttId}`
     topics.verifyAll = `${PREFIX}/${rh}/v/+`
+    topics.imgAll    = `${PREFIX}/${rh}/i/+/+`
+    topics.imgReq    = `${PREFIX}/${rh}/i/req`
 
     ydoc = new Y.Doc()
     ytext = ydoc.getText('quill')
@@ -538,7 +793,18 @@ async function enter (roomName, password, name, isNew) {
     publishSnapshot()
     broadcastAwareness()
 
-    snapTimer  = setInterval(publishSnapshot, SNAP_MS)
+    // 问一句「谁有图」—— 在线的人会把本地图片重播过来（retained 有兜底，这里补漏）
+    setTimeout(() => {
+      if (joined && connected) {
+        sendEnc(T_IMG_REQ, te.encode('req'), topics.imgReq, { retain: false, qos: 1 })
+      }
+    }, 1800)
+
+    snapTimer  = setInterval(() => {
+      if (!snapDirty) return
+      snapDirty = false
+      publishSnapshot()
+    }, SNAP_MS)
     awareTimer = setInterval(broadcastAwareness, AW_MS)
     startPeerSweeper()
 
@@ -560,18 +826,45 @@ async function enter (roomName, password, name, isNew) {
 
 function startEditor () {
   Quill.register('modules/cursors', QuillCursors)
+  Quill.register(GbImage, true)
 
   quill = new Quill('#editor', {
     theme: 'snow',
     placeholder: '开始写吧…  几个人同时打字也不会互相覆盖。',
     modules: {
-      toolbar: '#toolbar',
+      toolbar: {
+        container: '#toolbar',
+        handlers: { image: pickImage }
+      },
       cursors: { transformOnTextChange: true },
       history: { userOnly: true }
     }
   })
 
   binding = new QuillBinding(ytext, quill, awareness)
+
+  // 粘贴 / 拖拽图片
+  quill.root.addEventListener('paste', e => {
+    const files = [...((e.clipboardData && e.clipboardData.files) || [])]
+      .filter(f => f.type && f.type.startsWith('image/'))
+    if (files.length) {
+      e.preventDefault()
+      insertImageFiles(files)
+    }
+  })
+
+  quill.root.addEventListener('dragover', e => {
+    if (e.dataTransfer && [...e.dataTransfer.types].includes('Files')) e.preventDefault()
+  })
+
+  quill.root.addEventListener('drop', e => {
+    const files = [...((e.dataTransfer && e.dataTransfer.files) || [])]
+      .filter(f => f.type && f.type.startsWith('image/'))
+    if (files.length) {
+      e.preventDefault()
+      insertImageFiles(files)
+    }
+  })
 
   // 本地改动 → 立刻广播增量
   ydoc.on('update', (update, origin) => {
@@ -580,6 +873,7 @@ function startEditor () {
       return
     }
     if (!joined) return
+    snapDirty = true
     sendEnc(T_UPDATE, update, topics.update, { retain: false, qos: 1 })
     saveLocal()
     setSync('pending', '同步中…')
